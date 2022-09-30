@@ -1,11 +1,10 @@
-# coding:utf-8
-
-import socket
 from multiprocessing.dummy import Pool as ThreadPool
-import io
+from wsgi_app import simple_app
 import traceback
 import logging
+import socket
 import os
+import io
 
 
 class Server(object):
@@ -53,7 +52,7 @@ class Server(object):
             if method == "GET":
                 code = self.try_file(conn, path)
             elif method == "POST":
-                code = self.unimplemented(conn)
+                code = self.protocol_wsgi(conn, method, path, headers, body)
             else:
                 code = self.unimplemented(conn)
             self._logger.info("{}:{} {} {} {} {}".format(addr[0], addr[1], http_version, method, path, code))
@@ -98,6 +97,59 @@ class Server(object):
         conn.sendall(b"\r\n")
         conn.sendall(html)
         return 404
+
+    def protocol_wsgi(self, conn: socket.socket, method: str, path: str, headers: dict, body: bytes):
+        environ = {
+            "wsgi.input": io.BytesIO(body),
+            "REQUEST_METHOD": method,
+            "SCRIPT_NAME": "",
+            "PATH_INFO": path,
+            "QUERY_STRING": "",
+            "CONTENT_TYPE": headers.get("content-type"),
+            "CONTENT_LENGTH": headers.get("content-length"),
+            "SERVER_NAME": "",
+            "SERVER_PORT": "",
+            "SERVER_PROTOCOL": "HTTP/1.0",
+        }
+
+        headers_set = []
+        headers_sent = []
+
+        def write(data):
+            if not headers_set:
+                raise AssertionError("write() before start_response()")
+
+            if not headers_sent:
+                # Before the first output, send the stored headers
+                headers_sent[:] = headers_set
+                status, response_headers = headers_set[0], headers_set[1]
+                conn.sendall("HTTP/1.0 {}\r\n".format(status).encode())
+                for header in response_headers:
+                    conn.sendall("{}: {}\r\n".format(header[0], header[1]).encode())
+                conn.sendall(b"\r\n")
+
+            conn.sendall(data)
+
+        def start_response(status, response_headers, exc_info=None):
+            if headers_set:
+                raise AssertionError("Headers already set!")
+            headers_set[:] = [status, response_headers]
+            return write
+
+        # exec wsgi app
+        result = simple_app(environ, start_response)
+
+        # flush body
+        try:
+            for data in result:
+                if data:    # don't send headers until body appears
+                    write(data.encode())
+            if not headers_sent:
+                write("")   # send headers now if body was empty
+        finally:
+            if hasattr(result, "close"):
+                result.close()
+        return headers_sent[0]
 
     def unimplemented(self, conn: socket.socket):
         html = "<html>"
